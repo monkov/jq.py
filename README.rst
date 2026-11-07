@@ -176,6 +176,45 @@ Call ``iter()`` to get all of the output elements as an iterator:
     assert next(iterator, None) == 4
     assert next(iterator, None) == None
 
+Native serialized output (downstream revision)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This downstream ``1.13.0+diadia.1`` revision adds ``text_items()``. Unlike
+``text()``, it serializes values inside libjq before converting them to Python.
+This preserves native JSON number representations, including integers larger
+than Python's floating-point precision, and allows incremental output limits:
+
+.. code-block:: python
+
+    from contextlib import closing
+
+    program = jq.compile(".")
+    with closing(program.input_text("9007199254740993").text_items()) as items:
+        assert next(items) == "9007199254740993"
+
+``pretty=True`` selects two-space JSON indentation. ``raw=True`` returns string
+values without JSON quotes; other values retain JSON formatting. Items have no
+separating or trailing newline, so callers can encode and count each complete
+value before storing it. Use ``close()`` when stopping early; exhaustion and
+errors close the iterator automatically. Closing is idempotent and waits for an
+active ``next()`` call.
+
+``input`` and ``inputs`` consume the same input stream as outer iteration.
+Successful ``halt`` / ``halt_error(0)`` stop the entire stream. A nonzero
+``halt_error`` raises ``ValueError`` even if previous values were returned.
+Callers that save output should collect a successful complete result before
+replacing a destination.
+
+Native compilation, parsing, evaluation, and serialization release the GIL.
+Calls to one iterator are serialized; separate iterators can run concurrently.
+This does not provide a hard evaluation timeout, a native allocation limit, or
+isolation from the host environment and module filesystem. Cancelling a Python
+wait does not terminate an evaluation already running in another thread.
+
+The patch is based on upstream tag ``1.13.0`` and retains its bundled libjq
+1.8.2 source and BSD-2-Clause binding license. Its distinct downstream version
+must not be represented as the unmodified upstream release.
+
 Arguments
 ~~~~~~~~~
 

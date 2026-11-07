@@ -1,6 +1,21 @@
 Changelog
 =========
 
+1.13.0+diadia.1
+--------------
+
+* Add native ``text_items(pretty=False, raw=False)`` iteration and explicit
+  iterator ``close()`` without converting JSON numbers through Python floats.
+
+* Release the GIL during native compilation, parsing, evaluation, and output
+  serialization; serialize calls to each iterator and detach native callbacks
+  before returning state to its pool.
+
+* Preserve jq stream input callbacks and successful/nonzero halt behavior.
+
+This downstream revision is based on upstream tag ``1.13.0`` and still builds
+the bundled jq 1.8.2. It does not add hard cancellation or runtime isolation.
+
 1.13.0
 ------
 

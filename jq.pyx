@@ -53,6 +53,7 @@ cdef extern from "jv.h":
     double jv_number_value(jv)
 
     jv jv_array()
+    jv jv_null()
 
     # array: consumed
     # element: consumed
@@ -85,9 +86,11 @@ cdef extern from "jv.h":
     jv_parser* jv_parser_new(int)
     void jv_parser_free(jv_parser*)
     void jv_parser_set_buf(jv_parser*, const char*, int, int)
-    jv jv_parser_next(jv_parser*)
+    jv jv_parser_next(jv_parser*) nogil
 
     jv jv_parse(const char*)
+    jv jv_dump_string(jv, int) nogil
+    int JV_PRINT_INDENT_FLAGS(int)
 
 
 cdef extern from "jq.h":
@@ -95,13 +98,18 @@ cdef extern from "jq.h":
         pass
 
     ctypedef void (*jq_err_cb)(void *, jv)
+    ctypedef jv (*jq_input_cb)(jq_state *, void *) noexcept nogil
 
     jq_state *jq_init()
-    void jq_teardown(jq_state **)
-    int jq_compile(jq_state *, const char* str)
-    int jq_compile_args(jq_state *, const char* str, jv)
-    void jq_start(jq_state *, jv value, int flags)
-    jv jq_next(jq_state *)
+    void jq_teardown(jq_state **) nogil
+    int jq_compile(jq_state *, const char* str) nogil
+    int jq_compile_args(jq_state *, const char* str, jv) nogil
+    void jq_start(jq_state *, jv value, int flags) nogil
+    jv jq_next(jq_state *) nogil
+    int jq_halted(jq_state *)
+    jv jq_get_exit_code(jq_state *)
+    jv jq_get_error_message(jq_state *)
+    void jq_set_input_cb(jq_state *, jq_input_cb, void *)
     void jq_set_error_cb(jq_state *, jq_err_cb, void *)
     void jq_get_error_cb(jq_state *, jq_err_cb *, void **)
 
@@ -196,6 +204,7 @@ cdef jq_state* _compile(object program_bytes, object args) except NULL:
     cdef _ErrorStore error_store
     cdef jv jv_args
     cdef int compiled
+    cdef const char* c_program = PyBytes_AsString(program_bytes)
     try:
         if not jq:
             raise Exception("jq_init failed")
@@ -206,11 +215,13 @@ cdef jq_state* _compile(object program_bytes, object args) except NULL:
             jq_set_error_cb(jq, _store_error, <void*>error_store)
 
             if args is None:
-                compiled = jq_compile(jq, program_bytes)
+                with nogil:
+                    compiled = jq_compile(jq, c_program)
             else:
                 args_bytes = json.dumps(args).encode("utf-8")
                 jv_args = jv_parse(PyBytes_AsString(args_bytes))
-                compiled = jq_compile_args(jq, program_bytes, jv_args)
+                with nogil:
+                    compiled = jq_compile_args(jq, c_program, jv_args)
 
             if error_store.has_errors():
                 raise ValueError(error_store.error_string())
@@ -220,12 +231,13 @@ cdef jq_state* _compile(object program_bytes, object args) except NULL:
     except:
         jq_teardown(&jq)
         raise
-    # TODO: unset error callback?
+    # The compiler callback points at a Python object owned only by this call.
+    jq_set_error_cb(jq, NULL, NULL)
 
     return jq
 
 
-cdef void _store_error(void* store_ptr, jv error) noexcept:
+cdef void _store_error(void* store_ptr, jv error) noexcept with gil:
     cdef _ErrorStore store = <_ErrorStore>store_ptr
 
     error_string = _jq_error_to_py_string(error)
@@ -286,7 +298,8 @@ cdef class _JqStatePool(object):
         self._lock = threading.Lock()
 
     def __dealloc__(self):
-        jq_teardown(&self._jq_state)
+        with nogil:
+            jq_teardown(&self._jq_state)
 
     cdef jq_state* acquire(self):
         with self._lock:
@@ -298,11 +311,16 @@ cdef class _JqStatePool(object):
                 return state
 
     cdef void release(self, jq_state* state):
+        # Drop suspended stack values before retaining compiled code for reuse.
+        cdef jv empty_input = jv_null()
+        with nogil:
+            jq_start(state, empty_input, 0)
         with self._lock:
             if self._jq_state == NULL:
                 self._jq_state = state
             else:
-                jq_teardown(&state)
+                with nogil:
+                    jq_teardown(&state)
 
 
 cdef class _Program(object):
@@ -369,6 +387,17 @@ cdef class _ProgramWithInput(object):
     cdef _ResultIterator _make_iterator(self):
         return _ResultIterator(self._jq_state_pool, self._bytes_input, slurp=self._slurp)
 
+    def text_items(self, *, pretty=False, raw=False):
+        """Iterate native JSON text, or unquoted strings when raw is true.
+
+        Values have no separator or trailing newline. Close the iterator when
+        stopping early to return its native state and release its input buffer.
+        """
+        return _ResultIterator(
+            self._jq_state_pool, self._bytes_input, slurp=self._slurp,
+            serialized=True, pretty=pretty, raw=raw,
+        )
+
     def text(self):
         # Performance testing suggests that using _jv_to_python (within the
         # result iterator) followed by json.dumps is faster than using
@@ -390,35 +419,108 @@ cdef class _ResultIterator(object):
     cdef bytes _bytes_input
     cdef bint _slurp
     cdef bint _ready
+    cdef bint _done
+    cdef bint _serialized
+    cdef bint _raw
+    cdef int _dump_flags
+    cdef object _lock
 
     def __dealloc__(self):
-        self._jq_state_pool.release(self._jq)
-        jv_parser_free(self._parser)
+        if self._jq != NULL:
+            jq_set_input_cb(self._jq, NULL, NULL)
+            self._jq_state_pool.release(self._jq)
+        if self._parser != NULL:
+            jv_parser_free(self._parser)
 
-    def __cinit__(self, _JqStatePool jq_state_pool, bytes bytes_input, *, bint slurp):
+    def __cinit__(self, _JqStatePool jq_state_pool, bytes bytes_input, *, bint slurp,
+                  bint serialized=False, bint pretty=False, bint raw=False):
         self._jq_state_pool = jq_state_pool
+        self._lock = threading.Lock()
         self._jq = jq_state_pool.acquire()
         self._bytes_input = bytes_input
         self._slurp = slurp
         self._ready = False
+        self._done = False
+        self._serialized = serialized
+        self._raw = raw
+        self._dump_flags = JV_PRINT_INDENT_FLAGS(2) if pretty else 0
         cdef jv_parser* parser = jv_parser_new(0)
         cdef char* cbytes_input
         cdef ssize_t clen_input
         PyBytes_AsStringAndSize(bytes_input, &cbytes_input, &clen_input)
         jv_parser_set_buf(parser, cbytes_input, clen_input, 0)
         self._parser = parser
+        jq_set_input_cb(self._jq, _read_next_input, <void*>self._parser)
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        # jq_next releases the GIL, so callers must not enter one state twice.
+        with self._lock:
+            try:
+                return self._next()
+            except BaseException:
+                self._close()
+                raise
+
+    def close(self):
+        """Release native state and buffered input; wait for an active next call."""
+        with self._lock:
+            self._close()
+
+    cdef void _close(self):
+        self._done = True
+        if self._jq != NULL:
+            jq_set_input_cb(self._jq, NULL, NULL)
+            self._jq_state_pool.release(self._jq)
+            self._jq = NULL
+        if self._parser != NULL:
+            jv_parser_free(self._parser)
+            self._parser = NULL
+        self._bytes_input = b""
+
+    cdef object _next(self):
+        cdef jv result
+        cdef jv serialized
+        cdef jv exit_code
+        cdef jv halt_message
+        cdef double code
+        if self._done:
+            raise StopIteration()
         while True:
             if not self._ready:
                 self._ready_next_input()
                 self._ready = True
 
-            result = jq_next(self._jq)
+            with nogil:
+                result = jq_next(self._jq)
+            if jq_halted(self._jq):
+                self._done = True
+                jv_free(result)
+                exit_code = jq_get_exit_code(self._jq)
+                halt_message = jq_get_error_message(self._jq)
+                try:
+                    if jv_is_valid(exit_code):
+                        code = jv_number_value(exit_code)
+                        if code != 0:
+                            message = _jq_error_to_py_string(halt_message)
+                            raise ValueError(f"jq halted with exit code {code:g}: {message}")
+                finally:
+                    jv_free(exit_code)
+                    jv_free(halt_message)
+                raise StopIteration()
             if jv_is_valid(result):
+                if self._serialized:
+                    if self._raw and jv_get_kind(result) == JV_KIND_STRING:
+                        serialized = result
+                    else:
+                        with nogil:
+                            serialized = jv_dump_string(result, self._dump_flags)
+                    try:
+                        return jv_string_to_py_string(serialized)
+                    finally:
+                        jv_free(serialized)
                 return _jv_to_python(result)
             elif jv_invalid_has_msg(jv_copy(result)):
                 error_message = jv_invalid_get_msg(result)
@@ -449,11 +551,14 @@ cdef class _ResultIterator(object):
         else:
             value = self._parse_next_input()
 
-        jq_start(self._jq, value, jq_flags)
+        with nogil:
+            jq_start(self._jq, value, jq_flags)
         return 0
 
     cdef inline jv _parse_next_input(self) except *:
-        cdef jv value = jv_parser_next(self._parser)
+        cdef jv value
+        with nogil:
+            value = jv_parser_next(self._parser)
         if jv_is_valid(value):
             return value
         elif jv_invalid_has_msg(jv_copy(value)):
@@ -464,6 +569,10 @@ cdef class _ResultIterator(object):
         else:
             jv_free(value)
             raise StopIteration()
+
+
+cdef jv _read_next_input(jq_state* state, void* data) noexcept nogil:
+    return jv_parser_next(<jv_parser*>data)
 
 
 def all(program, value=_NO_VALUE, text=_NO_VALUE):
